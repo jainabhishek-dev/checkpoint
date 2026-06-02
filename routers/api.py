@@ -79,20 +79,28 @@ async def get_me(request: Request):
 
 @router.get("/drive-image/{file_id}")
 async def proxy_drive_image(request: Request, file_id: str):
-    """Redirect to Google Drive's public CDN URL for a page image.
+    """Proxy a Drive page image using a lightweight httpx fetch (no Drive API client).
 
-    Images are uploaded with 'anyone can view' permission, so they can be
-    served directly by Google CDN without loading any bytes into Render memory.
-    The user must still be authenticated to obtain the redirect URL.
+    Images are public ('anyone can view'), so no OAuth token is needed to
+    download them. Using httpx directly instead of the Google API client
+    saves ~15 MB per request (no Resource object creation overhead).
+    The 24-hour browser cache means repeat history views cost zero server memory.
     """
     user = auth.get_current_user(request)
     if not user:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    from fastapi.responses import RedirectResponse
-    return RedirectResponse(
-        url=f"https://drive.google.com/uc?export=view&id={file_id}",
-        status_code=302,
-    )
+    import httpx
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=15) as client:
+            resp = await client.get(
+                f"https://drive.google.com/uc?export=download&id={file_id}"
+            )
+            resp.raise_for_status()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Drive fetch failed: {e}")
+    return Response(content=resp.content, media_type="image/jpeg", headers={
+        "Cache-Control": "public, max-age=86400",
+    })
 
 
 # ── Workflows & checkpoints ────────────────────────────────────────────────────

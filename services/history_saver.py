@@ -33,26 +33,22 @@ async def save_run_to_history(
     job: dict,
     all_findings: list,
     total_pages: int,
-    token: dict,
-    job_dir: Path,
+    page_records: list[dict] | None = None,
+    drive_folder_id: str | None = None,
 ) -> None:
     """
-    Persist a completed review run to Supabase (immediately) then Google Drive
-    (page images, slow). Runs as an independent asyncio.Task so that a client
-    disconnect cannot cancel it.
+    Persist a completed review run to Supabase. Page images are already uploaded
+    to Drive during processing (per-page, in parallel with AI calls), so this
+    function only needs to write Supabase records.
 
     Order:
-      1. insert_run (drive_folder_id=None) — run visible in history immediately
+      1. insert_run — run visible in history immediately
       2. insert_run_findings — findings visible immediately
-      3. Upload page images to Drive (slow)
-      4. insert_run_pages
-      5. update_run to back-fill drive_folder_id
+      3. insert_run_pages + update_run drive_folder_id (images already in Drive)
     """
-    loop = asyncio.get_running_loop()
-    runs_folder_id = os.getenv("DRIVE_RUNS_FOLDER_ID")
     wf = next((w for w in state.WORKFLOWS if w["id"] == job.get("workflow_id")), {})
 
-    # ── Steps 1 & 2: Insert to Supabase immediately ───────────────────────────
+    # ── Steps 1 & 2: Insert run + findings to Supabase ────────────────────────
     try:
         db.insert_run({
             "id": job_id,
@@ -62,7 +58,7 @@ async def save_run_to_history(
             "document_name": job.get("title"),
             "drive_url": job.get("drive_url"),
             "file_type": job.get("file_type"),
-            "drive_folder_id": None,
+            "drive_folder_id": drive_folder_id,
             "checkpoint_ids": job.get("checkpoint_ids", []),
             "total_pages": total_pages,
             "total_findings": len(all_findings),
@@ -91,30 +87,13 @@ async def save_run_to_history(
         print(f"[history] Supabase save failed for {job_id}: {e}")
         return
 
-    # ── Steps 3–5: Upload images to Drive then back-fill folder ID ────────────
-    if not runs_folder_id:
-        return
-
-    page_records: list[dict] = []
-    try:
-        drive_folder_id = await loop.run_in_executor(
-            None, partial(create_drive_subfolder, token, runs_folder_id, job_id)
-        )
-        for img_path in sorted(job_dir.glob("page_*.jpg")):
-            pg = int(img_path.stem.split("_")[1])
-            img_data = img_path.read_bytes()
-            file_id = await loop.run_in_executor(
-                None, partial(upload_jpeg_to_drive, token, drive_folder_id, img_path.name, img_data)
-            )
-            page_records.append({"run_id": job_id, "page_num": pg, "drive_file_id": file_id})
-            img_path.unlink(missing_ok=True)  # delete local file after successful Drive upload
-
-        if page_records:
+    # ── Step 3: Record page image Drive file IDs (already uploaded) ───────────
+    if page_records:
+        try:
             db.insert_run_pages(page_records)
-        db.update_run(job_id, {"drive_folder_id": drive_folder_id})
-        print(f"[history] Run {job_id} Drive upload complete: {len(page_records)} images.")
-    except Exception as e:
-        print(f"[history] Drive upload failed for {job_id}: {e}")
+            print(f"[history] Run {job_id} page records saved: {len(page_records)} pages.")
+        except Exception as e:
+            print(f"[history] Page records save failed for {job_id}: {e}")
 
 
 async def save_cic_run_to_history(

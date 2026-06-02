@@ -4,6 +4,7 @@
 
 import asyncio
 import json
+import os
 import uuid
 from functools import partial
 from typing import Annotated
@@ -20,6 +21,7 @@ from utils import (
 )
 from services.drive_service import (
     get_file_as_pdf, get_pdf_bytes_by_id, post_selected_comments,
+    create_drive_subfolder, upload_jpeg_to_drive,
 )
 from services.review_ai import (
     run_vision_check, run_vision_review, run_document_check, run_document_review,
@@ -113,6 +115,18 @@ async def _stream_processing(job_id: str, token: dict, retry_from: int = None):
         page_checkpoints = [cp for cp in selected_checkpoints if cp.get("scope") != "document"]
         doc_checkpoints  = [cp for cp in selected_checkpoints if cp.get("scope") == "document"]
 
+        # Create Drive subfolder upfront so per-page uploads can start immediately
+        runs_folder_id = os.getenv("DRIVE_RUNS_FOLDER_ID")
+        drive_folder_id = None
+        page_records: list[dict] = []
+        if runs_folder_id:
+            try:
+                drive_folder_id = await loop.run_in_executor(
+                    None, partial(create_drive_subfolder, token, runs_folder_id, job_id)
+                )
+            except Exception as e:
+                print(f"[review] Drive folder creation failed for {job_id}: {e}")
+
         # ── Page-by-page processing (only if page-scope checkpoints selected) ─
         if page_checkpoints:
             for page_num in range(start_page, total_pages + 1):
@@ -122,15 +136,32 @@ async def _stream_processing(job_id: str, token: dict, retry_from: int = None):
                     pix = page.get_pixmap(matrix=mat, alpha=False)
                     img_bytes = pix.tobytes(output="jpeg")
 
-                    img_path = job_dir / f"page_{page_num:03d}.jpg"
-                    img_path.write_bytes(img_bytes)
-
-                    yield f"event: page_ready\ndata: {json.dumps({'page': page_num, 'total_pages': total_pages})}\n\n"
-
-                    findings = await loop.run_in_executor(
-                        None, partial(run_vision_check, img_bytes, page_checkpoints, page_num, workflow_name,
-                                      job.get("page_prompt") or None)
+                    # Start Drive upload and AI check in parallel
+                    upload_future = None
+                    if drive_folder_id:
+                        upload_future = loop.run_in_executor(
+                            None, partial(upload_jpeg_to_drive, token, drive_folder_id,
+                                          f"page_{page_num:03d}.jpg", img_bytes)
+                        )
+                    ai_future = loop.run_in_executor(
+                        None, partial(run_vision_check, img_bytes, page_checkpoints, page_num,
+                                      workflow_name, job.get("page_prompt") or None)
                     )
+
+                    # Await upload first (typically done within the AI call window)
+                    drive_file_id = None
+                    if upload_future:
+                        try:
+                            drive_file_id = await upload_future
+                            page_records.append({"run_id": job_id, "page_num": page_num,
+                                                 "drive_file_id": drive_file_id})
+                        except Exception as e:
+                            print(f"[review] Drive upload failed p{page_num}: {e}")
+
+                    yield f"event: page_ready\ndata: {json.dumps({'page': page_num, 'total_pages': total_pages, 'drive_file_id': drive_file_id})}\n\n"
+
+                    # Await AI result
+                    findings = await ai_future
 
                     for finding in findings:
                         finding["id"] = finding_id_counter
@@ -154,8 +185,6 @@ async def _stream_processing(job_id: str, token: dict, retry_from: int = None):
                             if rev:
                                 f["review_status"] = rev["verdict"]
                                 f["review_comment"] = rev["reason"]
-
-                    del img_bytes
 
                 except Exception as e:
                     job["last_successful_page"] = page_num - 1
@@ -237,8 +266,8 @@ async def _stream_processing(job_id: str, token: dict, retry_from: int = None):
             job=dict(job),
             all_findings=list(all_findings),
             total_pages=total_pages,
-            token=token,
-            job_dir=job_dir,
+            page_records=list(page_records),
+            drive_folder_id=drive_folder_id,
         ))
 
         yield f"event: all_done\ndata: {json.dumps({'total_findings': len(all_findings)})}\n\n"

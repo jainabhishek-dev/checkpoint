@@ -23,7 +23,7 @@ from utils import (
     load_job, next_checkpoint_id, save_job, slugify, to_ist,
     cascade_delete_workflow,
 )
-from services.drive_service import get_file_as_pdf, get_pdf_bytes_by_id, fetch_drive_comments_with_pages, download_drive_image
+from services.drive_service import get_file_as_pdf, get_pdf_bytes_by_id, fetch_drive_comments_with_pages
 from services.ak_ai import AK_REVIEW_DEFAULT_PROMPT, list_exercises, extract_exercise_questions, verify_exercise_questions, review_ak_exercise
 from services.history_saver import save_ak_run_to_history
 
@@ -79,25 +79,20 @@ async def get_me(request: Request):
 
 @router.get("/drive-image/{file_id}")
 async def proxy_drive_image(request: Request, file_id: str):
-    """Proxy a Drive JPEG (page image) back to the browser at full resolution.
+    """Redirect to Google Drive's public CDN URL for a page image.
 
-    <img> tags cannot send OAuth tokens, so the frontend uses this endpoint
-    instead of hitting Drive directly. The user's session token is used to
-    download the file and the raw bytes are returned with image/jpeg content-type.
+    Images are uploaded with 'anyone can view' permission, so they can be
+    served directly by Google CDN without loading any bytes into Render memory.
+    The user must still be authenticated to obtain the redirect URL.
     """
-    token = auth.get_token(request)
-    if not token:
+    user = auth.get_current_user(request)
+    if not user:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    loop = asyncio.get_running_loop()
-    try:
-        img_bytes = await loop.run_in_executor(
-            None, lambda: download_drive_image(token, file_id)
-        )
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Drive fetch failed: {e}")
-    return Response(content=img_bytes, media_type="image/jpeg", headers={
-        "Cache-Control": "private, max-age=3600",
-    })
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(
+        url=f"https://drive.google.com/uc?export=view&id={file_id}",
+        status_code=302,
+    )
 
 
 # ── Workflows & checkpoints ────────────────────────────────────────────────────

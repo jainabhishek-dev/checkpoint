@@ -128,6 +128,10 @@ async def _stream_cic_processing(job_id: str, token: dict):
             yield f"event: error\ndata: {json.dumps({'message': f'Could not parse PDFs: {str(e)}'})}\n\n"
             return
 
+        # Free PDF bytes early — fitz has loaded them into its own C-level memory.
+        # They will be re-fetched below only if the global check is needed.
+        del f1_bytes, f2_bytes
+
         total_pages = max(len(f1_doc), len(f2_doc))
 
         yield f"event: cic_start\ndata: {json.dumps({'total_comments': len(all_comments), 'total_pages': total_pages})}\n\n"
@@ -201,10 +205,24 @@ async def _stream_cic_processing(job_id: str, token: dict):
         global_verdict_results = []
         if not_sure_comments:
             yield f"event: cic_global_start\ndata: {json.dumps({'count': len(not_sure_comments)})}\n\n"
+            # Re-fetch both PDFs — they were freed early above to save memory during the page loop.
+            try:
+                _f1 = await loop.run_in_executor(
+                    None, partial(get_pdf_bytes_by_id, token, job["commented_file_id"])
+                )
+                _f2 = await loop.run_in_executor(
+                    None, partial(get_pdf_bytes_by_id, token, job["revised_file_id"])
+                )
+                _f1_bytes = _f1["pdf_bytes"]
+                _f2_bytes = _f2["pdf_bytes"]
+            except Exception as e:
+                yield f"event: error\ndata: {json.dumps({'message': f'Could not reload files for global check: {str(e)}'})}\n\n"
+                return
             try:
                 global_verdicts = await loop.run_in_executor(
-                    None, partial(run_cic_global_check, f1_bytes, f2_bytes, not_sure_comments)
+                    None, partial(run_cic_global_check, _f1_bytes, _f2_bytes, not_sure_comments)
                 )
+                del _f1_bytes, _f2_bytes  # free immediately after use
                 verdict_map = {v["comment_id"]: v for v in global_verdicts}
                 for c in not_sure_comments:
                     cid = c["id"]
@@ -224,8 +242,6 @@ async def _stream_cic_processing(job_id: str, token: dict):
                 return
 
             yield f"event: cic_global\ndata: {json.dumps({'verdicts': global_verdict_results})}\n\n"
-
-        del f1_bytes, f2_bytes
 
         fixed_count = sum(1 for c in comment_tracker.values() if c["verdict"] == "fixed")
         not_fixed_count = sum(1 for c in comment_tracker.values() if c["verdict"] == "not_fixed")

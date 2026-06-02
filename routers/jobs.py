@@ -102,6 +102,10 @@ async def _stream_processing(job_id: str, token: dict, retry_from: int = None):
 
             yield f"event: retry_start\ndata: {json.dumps({'starting_page': start_page, 'total_pages': total_pages})}\n\n"
 
+        # Free PDF bytes — fitz has loaded them into its own C-level memory.
+        # They will be re-fetched below only if the document-level check is needed.
+        del pdf_bytes
+
         selected_checkpoints = [
             state.CHECKPOINT_MAP[cid] for cid in job["checkpoint_ids"] if cid in state.CHECKPOINT_MAP
         ]
@@ -181,6 +185,17 @@ async def _stream_processing(job_id: str, token: dict, retry_from: int = None):
         # ── Document-level check (only if document-scope checkpoints selected) ─
         if doc_checkpoints or job.get("doc_prompt"):
             yield f"event: document_start\ndata: {json.dumps({})}\n\n"
+            # Re-fetch PDF bytes — freed early above to save memory during the page loop.
+            try:
+                _pdf_reload = await loop.run_in_executor(
+                    None, partial(get_pdf_bytes_by_id, token, job["file_id"])
+                )
+                pdf_bytes = _pdf_reload.get("pdf_bytes")
+                if not pdf_bytes:
+                    raise ValueError("No PDF bytes retrieved")
+            except Exception as e:
+                yield f"event: error\ndata: {json.dumps({'message': f'Could not reload PDF for document check: {str(e)}'})}\n\n"
+                return
             try:
                 doc_findings = await loop.run_in_executor(
                     None, partial(run_document_check, pdf_bytes, doc_checkpoints,
@@ -215,7 +230,7 @@ async def _stream_processing(job_id: str, token: dict, retry_from: int = None):
             except Exception as e:
                 yield f"event: error\ndata: {json.dumps({'message': f'Document-level check failed: {str(e)}'})}\n\n"
 
-        del pdf_bytes
+            del pdf_bytes  # free immediately after use
 
         asyncio.create_task(save_run_to_history(
             job_id=job_id,

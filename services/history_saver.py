@@ -107,6 +107,7 @@ async def save_run_to_history(
                 None, partial(upload_jpeg_to_drive, token, drive_folder_id, img_path.name, img_data)
             )
             page_records.append({"run_id": job_id, "page_num": pg, "drive_file_id": file_id})
+            img_path.unlink(missing_ok=True)  # delete local file after successful Drive upload
 
         if page_records:
             db.insert_run_pages(page_records)
@@ -204,6 +205,7 @@ async def save_cic_run_to_history(
                 "file_version": file_version,
                 "drive_file_id": drive_file_id,
             })
+            img_path.unlink(missing_ok=True)  # delete local file after successful Drive upload
 
         if page_records:
             db.insert_cic_run_pages(page_records)

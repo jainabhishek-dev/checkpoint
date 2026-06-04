@@ -79,30 +79,33 @@ async def get_me(request: Request):
 
 @router.get("/drive-image/{file_id}")
 async def proxy_drive_image(request: Request, file_id: str):
-    """Proxy a Drive page image using a lightweight httpx fetch (no Drive API client).
+    """Proxy a Drive page image using an authenticated httpx fetch.
 
-    Images are public ('anyone can view'), so no OAuth token is needed to
-    download them. Using httpx directly instead of the Google API client
-    saves ~15 MB per request (no Resource object creation overhead).
-    The 24-hour browser cache means repeat history views cost zero server memory.
+    LEAD School's Google Workspace blocks unauthenticated Drive access at the
+    domain level — even 'anyone with the link' files redirect to sign-in for
+    anonymous requests. Uses the user's OAuth Bearer token with the Drive REST
+    API directly (no google-api-python-client Resource object, ~15 MB overhead
+    eliminated vs the old proxy). Works for both @leadschool.in and @lbpl.co.in.
     """
-    user = auth.get_current_user(request)
-    if not user:
+    token = auth.get_token(request)
+    if not token:
         raise HTTPException(status_code=401, detail="Not authenticated")
     import httpx
     try:
+        access_token = token.get("access_token", "")
         async with httpx.AsyncClient(follow_redirects=True, timeout=15) as client:
             resp = await client.get(
-                f"https://drive.google.com/uc?export=download&id={file_id}"
+                f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media",
+                headers={"Authorization": f"Bearer {access_token}"},
             )
             resp.raise_for_status()
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Drive fetch failed: {e}")
     content_type = resp.headers.get("content-type", "unknown")
     is_html = "text/html" in content_type
-    print(f"[drive-image] id={file_id} status={resp.status_code} type={content_type} size={len(resp.content)} is_html={is_html} url={str(resp.url)[:80]}")
+    print(f"[drive-image] id={file_id} status={resp.status_code} type={content_type} size={len(resp.content)} is_html={is_html}")
     return Response(content=resp.content, media_type="image/jpeg", headers={
-        "Cache-Control": "public, max-age=86400",
+        "Cache-Control": "private, max-age=3600",
     })
 
 

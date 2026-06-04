@@ -98,6 +98,9 @@ async def proxy_drive_image(request: Request, file_id: str):
             resp.raise_for_status()
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Drive fetch failed: {e}")
+    content_type = resp.headers.get("content-type", "unknown")
+    is_html = "text/html" in content_type
+    print(f"[drive-image] id={file_id} status={resp.status_code} type={content_type} size={len(resp.content)} is_html={is_html} url={str(resp.url)[:80]}")
     return Response(content=resp.content, media_type="image/jpeg", headers={
         "Cache-Control": "public, max-age=86400",
     })

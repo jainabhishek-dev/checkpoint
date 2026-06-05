@@ -221,8 +221,9 @@ def create_drive_subfolder(token: dict, parent_folder_id: str, folder_name: str)
 def upload_jpeg_to_drive(token: dict, folder_id: str, filename: str, image_bytes: bytes) -> str:
     """Upload a JPEG image to a Drive folder. Returns the uploaded file's Drive file ID.
 
-    The file is explicitly shared as 'anyone with the link can view' so it can
-    be embedded directly in <img> tags without authentication.
+    Attempts to set 'anyone can view' permission but silently continues if the
+    domain policy blocks it — the authenticated proxy serves files to LEAD School
+    users via OAuth token regardless of public sharing status.
     """
     from googleapiclient.http import MediaIoBaseUpload
 
@@ -234,12 +235,16 @@ def upload_jpeg_to_drive(token: dict, folder_id: str, filename: str, image_bytes
         body=metadata, media_body=media, fields="id"
     ).execute()
     file_id = file["id"]
-    # Files uploaded via API do not inherit parent folder sharing — make public.
-    drive_service.permissions().create(
-        fileId=file_id,
-        body={"type": "anyone", "role": "reader"},
-    ).execute()
-    return file_id
+    # Attempt to make the file publicly readable. This may fail if the domain
+    # policy blocks external sharing — that's fine, the authenticated proxy works.
+    try:
+        drive_service.permissions().create(
+            fileId=file_id,
+            body={"type": "anyone", "role": "reader"},
+        ).execute()
+    except Exception as e:
+        print(f"[drive] Could not set public permission on {file_id}: {e}")
+    return file_id  # always returned regardless of permissions outcome
 
 
 def fetch_drive_comments_with_pages(token: dict, file_id: str) -> list[dict]:

@@ -264,6 +264,38 @@ def fetch_runs(workflow_id: str | None = None) -> list[dict]:
     return resp.json()
 
 
+def _parse_total_count(content_range: str | None) -> int:
+    """Parse PostgREST's `Content-Range: 0-19/97` response header into 97."""
+    if not content_range or "/" not in content_range:
+        return 0
+    total_str = content_range.rsplit("/", 1)[-1]
+    return int(total_str) if total_str.isdigit() else 0
+
+
+def _fetch_page(table: str, workflow_id: str | None, limit: int, offset: int) -> tuple[list[dict], int]:
+    """Fetch one page of rows from `table` (most recent first) plus the total
+    row count, via PostgREST's native limit/offset + `Prefer: count=exact`."""
+    params: dict = {"order": "created_at.desc", "limit": str(limit), "offset": str(offset)}
+    if workflow_id:
+        params["workflow_id"] = f"eq.{workflow_id}"
+    headers = {**_headers(), "Prefer": "count=exact"}
+    resp = httpx.get(f"{_base_url()}/{table}", headers=headers, params=params, timeout=10)
+    resp.raise_for_status()
+    return resp.json(), _parse_total_count(resp.headers.get("content-range"))
+
+
+def fetch_runs_page(workflow_id: str | None, limit: int, offset: int) -> tuple[list[dict], int]:
+    return _fetch_page("runs", workflow_id, limit, offset)
+
+
+def fetch_cic_runs_page(workflow_id: str | None, limit: int, offset: int) -> tuple[list[dict], int]:
+    return _fetch_page("cic_runs", workflow_id, limit, offset)
+
+
+def fetch_ak_runs_page(workflow_id: str | None, limit: int, offset: int) -> tuple[list[dict], int]:
+    return _fetch_page("ak_runs", workflow_id, limit, offset)
+
+
 
 
 def fetch_run(run_id: str) -> dict | None:

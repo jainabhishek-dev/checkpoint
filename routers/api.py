@@ -320,45 +320,43 @@ async def api_run_cic_check(request: Request, body: dict = Body(...)):
 # ── History ────────────────────────────────────────────────────────────────────
 
 @router.get("/history")
-async def api_get_history(request: Request, tab: str = "review", workflow: str = ""):
+async def api_get_history(
+    request: Request, tab: str = "review", workflow: str = "", page: int = 1, limit: int = 20,
+):
     _require_user(request)
     workflow_id = workflow or None
+    if tab not in ("review", "cic", "ak"):
+        tab = "review"
+    page = max(page, 1)
+    limit = max(1, min(limit, 100))
+    offset = (page - 1) * limit
+
     review_workflows = [w for w in state.WORKFLOWS if w.get("type", "review") == "review"]
     cic_workflows = [w for w in state.WORKFLOWS if w.get("type") == "cic"]
     ak_workflows = [w for w in state.WORKFLOWS if w.get("type") == "ak_review"]
+    base = {
+        "active_tab": tab,
+        "review_workflows": review_workflows,
+        "cic_workflows": cic_workflows,
+        "ak_workflows": ak_workflows,
+        "page": page,
+        "limit": limit,
+    }
     if tab == "cic":
-        cic_runs = db.fetch_cic_runs(workflow_id=workflow_id)
+        cic_runs, total = db.fetch_cic_runs_page(workflow_id, limit, offset)
         for r in cic_runs:
             r["created_at"] = to_ist(r.get("created_at"))
-        return {
-            "runs": [], "cic_runs": cic_runs, "ak_runs": [],
-            "active_tab": "cic",
-            "review_workflows": review_workflows,
-            "cic_workflows": cic_workflows,
-            "ak_workflows": ak_workflows,
-        }
+        return {**base, "runs": [], "cic_runs": cic_runs, "ak_runs": [], "total": total}
     elif tab == "ak":
-        ak_runs = db.fetch_ak_runs(workflow_id=workflow_id)
+        ak_runs, total = db.fetch_ak_runs_page(workflow_id, limit, offset)
         for r in ak_runs:
             r["created_at"] = to_ist(r.get("created_at"))
-        return {
-            "runs": [], "cic_runs": [], "ak_runs": ak_runs,
-            "active_tab": "ak",
-            "review_workflows": review_workflows,
-            "cic_workflows": cic_workflows,
-            "ak_workflows": ak_workflows,
-        }
+        return {**base, "runs": [], "cic_runs": [], "ak_runs": ak_runs, "total": total}
     else:
-        runs = db.fetch_runs(workflow_id=workflow_id)
+        runs, total = db.fetch_runs_page(workflow_id, limit, offset)
         for r in runs:
             r["created_at"] = to_ist(r.get("created_at"))
-        return {
-            "runs": runs, "cic_runs": [], "ak_runs": [],
-            "active_tab": "review",
-            "review_workflows": review_workflows,
-            "cic_workflows": cic_workflows,
-            "ak_workflows": ak_workflows,
-        }
+        return {**base, "runs": runs, "cic_runs": [], "ak_runs": [], "total": total}
 
 
 @router.get("/history/cic/{run_id}")

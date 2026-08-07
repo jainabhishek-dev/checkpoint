@@ -125,6 +125,59 @@ def extract_file_id(url: str) -> str:
     )
 
 
+def _resolve_file_type(mime_type: str) -> str:
+    """Validate a Drive mimeType against supported types, raising ValueError
+    with a user-facing message if it's unsupported. Shared by every function
+    below that reads a file's metadata, so the rules stay in one place."""
+    if mime_type in UNSUPPORTED_TYPES:
+        raise ValueError(UNSUPPORTED_TYPES[mime_type])
+    if mime_type not in SUPPORTED_TYPES:
+        raise ValueError(
+            f"This file type ({mime_type}) is not supported. "
+            "Please provide a link to a Google Doc, Google Slides presentation, or PDF."
+        )
+    return SUPPORTED_TYPES[mime_type]
+
+
+def get_file_metadata(token: dict, drive_url: str) -> dict:
+    """
+    Look up a Drive file's title/type/size WITHOUT downloading its content.
+
+    Use this instead of get_file_as_pdf whenever only these details are
+    needed — downloading the full file just to read its name and throwing
+    the content away wastes bandwidth, and for large files can be the
+    difference between fitting in memory or not.
+
+    Returns:
+        {"file_id", "title", "file_type", "size_bytes"}
+        size_bytes is None when Drive doesn't report a comparable size for
+        this file — true for Google Docs/Slides, where the reported size is
+        Google's internal format, not the PDF that export would generate.
+    """
+    file_id = extract_file_id(drive_url)
+    creds = _build_credentials(token)
+    drive_service = _build_drive_service(creds)
+
+    metadata = (
+        drive_service.files()
+        .get(fileId=file_id, fields="id,name,mimeType,size", supportsAllDrives=True)
+        .execute()
+    )
+    mime_type = metadata.get("mimeType", "")
+    title = metadata.get("name", "Untitled")
+    file_type = _resolve_file_type(mime_type)
+
+    size_str = metadata.get("size")
+    size_bytes = int(size_str) if size_str and file_type == "pdf" else None
+
+    return {
+        "file_id": file_id,
+        "title": title,
+        "file_type": file_type,
+        "size_bytes": size_bytes,
+    }
+
+
 def get_file_as_pdf(token: dict, drive_url: str) -> dict:
     """
     Export a Google Drive file as PDF bytes.
@@ -146,17 +199,8 @@ def get_file_as_pdf(token: dict, drive_url: str) -> dict:
     )
     mime_type = metadata.get("mimeType", "")
     title = metadata.get("name", "Untitled")
+    file_type = _resolve_file_type(mime_type)
 
-    if mime_type in UNSUPPORTED_TYPES:
-        raise ValueError(UNSUPPORTED_TYPES[mime_type])
-
-    if mime_type not in SUPPORTED_TYPES:
-        raise ValueError(
-            f"This file type ({mime_type}) is not supported. "
-            "Please provide a link to a Google Doc, Google Slides presentation, or PDF."
-        )
-
-    file_type = SUPPORTED_TYPES[mime_type]
     pdf_bytes = _get_pdf_bytes_by_id(file_id, file_type, drive_service)
 
     if not pdf_bytes or len(pdf_bytes) == 0:

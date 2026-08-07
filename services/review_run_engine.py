@@ -23,12 +23,19 @@ import fitz
 import db
 import state
 from services.drive_service import (
-    get_file_as_pdf, create_drive_subfolder, upload_jpeg_to_drive,
+    get_file_metadata, get_file_as_pdf, create_drive_subfolder, upload_jpeg_to_drive,
 )
 from services.review_ai import (
     run_vision_check, run_vision_review, run_document_check, run_document_review,
     _build_vision_prompt, _build_document_prompt,
 )
+
+# Files over this size aren't accepted for automatic processing — downloading
+# and parsing something this large risks exhausting the backend's memory and
+# crashing the whole process (which takes every other in-progress run down
+# with it, not just this one). Only enforceable for actual PDF uploads; see
+# get_file_metadata for why Google Docs/Slides can't be checked this way.
+MAX_FILE_SIZE_BYTES = 100 * 1024 * 1024
 
 
 def _now_iso() -> str:
@@ -53,7 +60,15 @@ async def create_run(
     into their own error response (HTML template error vs. HTTPException).
     """
     loop = asyncio.get_running_loop()
-    file_data = await loop.run_in_executor(None, partial(get_file_as_pdf, token, drive_url))
+    file_data = await loop.run_in_executor(None, partial(get_file_metadata, token, drive_url))
+
+    size_bytes = file_data.get("size_bytes")
+    if size_bytes is not None and size_bytes > MAX_FILE_SIZE_BYTES:
+        size_mb = size_bytes / (1024 * 1024)
+        raise ValueError(
+            f"'{file_data['title']}' is {size_mb:.0f} MB, which is over the 100 MB limit for "
+            "automatic processing. Please split it into smaller sections and run each separately."
+        )
 
     page_cps = [cp for cp in selected_checkpoints if cp.get("scope") != "document"]
     doc_cps = [cp for cp in selected_checkpoints if cp.get("scope") == "document"]

@@ -25,6 +25,7 @@ from utils import (
 )
 from services.drive_service import get_file_as_pdf, get_pdf_bytes_by_id, fetch_drive_comments_with_pages
 from services.ak_ai import AK_REVIEW_DEFAULT_PROMPT, list_exercises, extract_exercise_questions, verify_exercise_questions, review_ak_exercise
+from services.review_run_engine import create_run, resume_run
 from services.history_saver import save_ak_run_to_history
 
 router = APIRouter()
@@ -156,7 +157,7 @@ async def api_preview_prompt(request: Request, body: dict = Body(...)):
 
 @router.post("/check")
 async def api_run_check(request: Request, body: dict = Body(...)):
-    """Validate input and create a review job. Returns {job_id}."""
+    """Validate input, create and start a review run. Returns {job_id}."""
     user = _require_user(request)
     token = _require_token(request)
 
@@ -176,19 +177,17 @@ async def api_run_check(request: Request, body: dict = Body(...)):
     selected_checkpoints = [
         state.CHECKPOINT_MAP[cid] for cid in checkpoint_ids if cid in state.CHECKPOINT_MAP
     ]
+    workflow = next((w for w in state.WORKFLOWS if w["id"] == workflow_id), {})
 
-    # Build and store the actual prompts that will be used for this run
-    from services.review_ai import _build_vision_prompt, _build_document_prompt
-    wf = next((w for w in state.WORKFLOWS if w["id"] == workflow_id), {})
-    page_cps = [cp for cp in selected_checkpoints if cp.get("scope") != "document"]
-    doc_cps = [cp for cp in selected_checkpoints if cp.get("scope") == "document"]
-    page_prompt = custom_page_prompt or _build_vision_prompt(page_cps, "{page_num}", wf.get("name", ""))
-    doc_prompt = custom_doc_prompt or (_build_document_prompt(doc_cps) if doc_cps else "")
-
-    loop = asyncio.get_running_loop()
     try:
-        file_data = await loop.run_in_executor(
-            None, partial(get_file_as_pdf, token, drive_url)
+        result = await create_run(
+            token=token,
+            checked_by=user["email"],
+            drive_url=drive_url,
+            workflow=workflow,
+            selected_checkpoints=selected_checkpoints,
+            custom_page_prompt=custom_page_prompt,
+            custom_doc_prompt=custom_doc_prompt,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -198,30 +197,19 @@ async def api_run_check(request: Request, body: dict = Body(...)):
             raise HTTPException(status_code=401, detail="Session expired. Please log in again.")
         raise HTTPException(status_code=400, detail=f"Could not read the file: {err}")
 
-    job_id = uuid.uuid4().hex
-    save_job(job_id, {
-        "drive_url": drive_url,
-        "checked_by": user["email"],
-        "file_id": file_data["file_id"],
-        "file_type": file_data["file_type"],
-        "title": file_data["title"],
-        "workflow_id": workflow_id,
-        "checkpoint_ids": [cp["id"] for cp in selected_checkpoints],
-        "page_prompt": page_prompt,
-        "doc_prompt": doc_prompt,
-        "status": "processing",
-    })
-    return {"job_id": job_id, "title": file_data["title"]}
+    return result
 
 
 @router.post("/retry-check/{job_id}")
 async def api_retry_check(request: Request, job_id: str):
     _require_user(request)
-    job = load_job(job_id)
-    if not job:
+    token = _require_token(request)
+    try:
+        return await resume_run(job_id, token)
+    except LookupError:
         raise HTTPException(status_code=404, detail="Job not found")
-    retry_from = job.get("last_successful_page", 0) + 1
-    return {"job_id": job_id, "retry_from": retry_from}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 @router.post("/insert-comments/{job_id}")
@@ -230,22 +218,21 @@ async def api_insert_comments(request: Request, job_id: str, body: dict = Body(.
     _require_user(request)
     token = _require_token(request)
 
-    from services.drive_service import post_selected_comments
+    from services.drive_service import post_selected_comments, extract_file_id
 
-    job = load_job(job_id)
-    if not job:
+    run = db.fetch_run(job_id)
+    if not run:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    job_dir = state._JOBS_DIR / job_id
-    findings_file = job_dir / "findings.json"
-    if not findings_file.exists():
-        raise HTTPException(status_code=404, detail="Findings not found")
-
-    all_findings = json.loads(findings_file.read_text(encoding="utf-8"))
+    all_findings = db.fetch_run_findings(job_id)
     finding_ids = [int(fid) for fid in (body.get("finding_ids") or []) if str(fid).isdigit()]
     selected = [f for f in all_findings if f.get("id") in finding_ids]
 
-    file_data = {"file_id": job["file_id"], "file_type": job["file_type"], "title": job["title"]}
+    file_data = {
+        "file_id": extract_file_id(run["drive_url"]),
+        "file_type": run["file_type"],
+        "title": run["document_name"],
+    }
     loop = asyncio.get_running_loop()
     try:
         posted = await loop.run_in_executor(

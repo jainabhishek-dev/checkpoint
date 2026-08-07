@@ -1,12 +1,13 @@
 """Review workflow routes: /check, /process/{id}, /stream/{id}, /job/{id}/page/{n},
 /retry-check/{id}, /insert-comments/{id}.
+
+Processing itself lives in services/review_run_engine.py as a background task
+independent of any request — these routes only create/resume runs and expose a
+read-only SSE view (replay of what's already in Supabase, then a live tail).
 """
 
 import asyncio
 import json
-import os
-import uuid
-from functools import partial
 from typing import Annotated
 
 from fastapi import APIRouter, Form, HTTPException
@@ -14,270 +15,86 @@ from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Stre
 from starlette.requests import Request
 
 import auth
+import db
 import state
-from utils import (
-    ctx, ensure_job_dir, filter_by_workflow, group_by_category,
-    load_job, save_job, templates,
-)
-from services.drive_service import (
-    get_file_as_pdf, get_pdf_bytes_by_id, post_selected_comments,
-    create_drive_subfolder, upload_jpeg_to_drive,
-)
-from services.review_ai import (
-    run_vision_check, run_vision_review, run_document_check, run_document_review,
-)
-from services.history_saver import save_run_to_history
+from utils import ctx, filter_by_workflow, group_by_category, templates
+from services.drive_service import extract_file_id, post_selected_comments
+from services.review_run_engine import create_run, resume_run
 
 router = APIRouter()
 
 
-# ── SSE streaming generator ────────────────────────────────────────────────────
+# ── SSE view generator (replay from Supabase, then live tail) ──────────────────
 
-async def _stream_processing(job_id: str, token: dict, retry_from: int = None):
-    """SSE generator for review processing: renders pages, calls AI, streams results."""
-    import fitz
-    from io import BytesIO
-
-    job = load_job(job_id)
-    if not job:
-        yield f"event: error\ndata: {json.dumps({'message': 'Job not found'})}\n\n"
-        return
-
-    state._ACTIVE_JOBS.add(job_id)
+async def _stream_view(job_id: str):
+    """Reconstruct a run's progress from Supabase for a newly-attached viewer,
+    then — if it's still processing — subscribe to live updates from whatever
+    background task (if any) is currently working on it. Never starts or stops
+    processing itself; multiple viewers (or a refreshed tab) can attach safely."""
+    loop = asyncio.get_running_loop()
+    q = None
     try:
-        workflow_id = job.get("workflow_id", "")
-        workflow = next((w for w in state.WORKFLOWS if w["id"] == workflow_id), None)
-        if not workflow:
-            yield f"event: error\ndata: {json.dumps({'message': f'Workflow \"{workflow_id}\" not found. It may have been deleted.'})}\n\n"
+        run = await loop.run_in_executor(None, db.fetch_run, job_id)
+        if not run:
+            yield f"event: error\ndata: {json.dumps({'message': 'Job not found'})}\n\n"
             return
-        workflow_name = workflow["name"]
 
-        loop = asyncio.get_running_loop()
-        job_dir = ensure_job_dir(job_id)
+        if run.get("status") == "processing":
+            # Subscribe before re-fetching so nothing published in the gap is missed.
+            q = state.subscribe(job_id)
+            run = await loop.run_in_executor(None, db.fetch_run, job_id)
 
-        # ── Load PDF ──────────────────────────────────────────────────────────
-        if retry_from is None:
-            try:
-                pdf_data = await loop.run_in_executor(
-                    None, partial(get_pdf_bytes_by_id, token, job["file_id"])
-                )
-                pdf_bytes = pdf_data.get("pdf_bytes")
-                if not pdf_bytes:
-                    raise ValueError("No PDF bytes retrieved")
-            except Exception as e:
-                yield f"event: error\ndata: {json.dumps({'message': f'Could not export file as PDF: {str(e)}'})}\n\n"
-                return
+        total_pages = run.get("total_pages") or 0
+        title = run.get("document_name", "")
+        if total_pages:
+            yield f"event: start\ndata: {json.dumps({'total_pages': total_pages, 'title': title})}\n\n"
 
-            try:
-                pdf_document = fitz.open(stream=BytesIO(pdf_bytes), filetype="pdf")
-            except Exception as e:
-                yield f"event: error\ndata: {json.dumps({'message': f'Could not parse PDF: {str(e)}'})}\n\n"
-                return
+        pages = await loop.run_in_executor(None, db.fetch_run_pages, job_id)
+        findings = await loop.run_in_executor(None, db.fetch_run_findings, job_id)
 
-            total_pages = len(pdf_document)
-            all_findings = []
-            finding_id_counter = 0
-            start_page = 1
-
-            yield f"event: start\ndata: {json.dumps({'total_pages': total_pages, 'title': job['title']})}\n\n"
-        else:
-            try:
-                pdf_data = await loop.run_in_executor(
-                    None, partial(get_pdf_bytes_by_id, token, job["file_id"])
-                )
-                pdf_bytes = pdf_data.get("pdf_bytes")
-                pdf_document = fitz.open(stream=BytesIO(pdf_bytes), filetype="pdf")
-            except Exception as e:
-                yield f"event: error\ndata: {json.dumps({'message': f'Could not re-open PDF: {str(e)}'})}\n\n"
-                return
-
-            total_pages = len(pdf_document)
-            start_page = retry_from
-
-            findings_file = job_dir / "findings.json"
-            if findings_file.exists():
-                all_findings = json.loads(findings_file.read_text(encoding="utf-8"))
-                finding_id_counter = max([f.get("id", 0) for f in all_findings] + [0]) + 1
+        image_by_page = {p["page_num"]: p["drive_file_id"] for p in pages}
+        findings_by_page: dict[int, list] = {}
+        doc_findings: list = []
+        for f in findings:
+            if f.get("page_num") is None:
+                doc_findings.append(f)
             else:
-                all_findings = []
-                finding_id_counter = 0
+                findings_by_page.setdefault(f["page_num"], []).append(f)
 
-            yield f"event: retry_start\ndata: {json.dumps({'starting_page': start_page, 'total_pages': total_pages})}\n\n"
+        last_successful_page = run.get("last_successful_page") or 0
+        for page_num in range(1, last_successful_page + 1):
+            drive_file_id = image_by_page.get(page_num)
+            yield f"event: page_ready\ndata: {json.dumps({'page': page_num, 'total_pages': total_pages, 'drive_file_id': drive_file_id})}\n\n"
+            yield f"event: page_findings\ndata: {json.dumps({'page': page_num, 'findings': findings_by_page.get(page_num, [])})}\n\n"
 
-        # Free PDF bytes — fitz has loaded them into its own C-level memory.
-        # They will be re-fetched below only if the document-level check is needed.
-        del pdf_bytes
+        if doc_findings:
+            yield f"event: document_findings\ndata: {json.dumps({'findings': doc_findings})}\n\n"
 
-        selected_checkpoints = [
-            state.CHECKPOINT_MAP[cid] for cid in job["checkpoint_ids"] if cid in state.CHECKPOINT_MAP
-        ]
+        status = run.get("status")
 
-        page_checkpoints = [cp for cp in selected_checkpoints if cp.get("scope") != "document"]
-        doc_checkpoints  = [cp for cp in selected_checkpoints if cp.get("scope") == "document"]
+        if status == "completed":
+            yield f"event: all_done\ndata: {json.dumps({'total_findings': run.get('total_findings', 0)})}\n\n"
+            return
 
-        # Create Drive subfolder upfront so per-page uploads can start immediately
-        runs_folder_id = os.getenv("DRIVE_RUNS_FOLDER_ID")
-        drive_folder_id = None
-        page_records: list[dict] = []
-        if runs_folder_id:
-            try:
-                drive_folder_id = await loop.run_in_executor(
-                    None, partial(create_drive_subfolder, token, runs_folder_id, job_id)
-                )
-            except Exception as e:
-                print(f"[review] Drive folder creation failed for {job_id}: {e}")
+        if status == "failed":
+            yield (
+                f"event: partial_complete\ndata: "
+                f"{json.dumps({'last_successful_page': last_successful_page, 'total_pages': total_pages, 'error_message': run.get('error_message') or 'Unknown error'})}\n\n"
+            )
+            return
 
-        # ── Page-by-page processing (only if page-scope checkpoints selected) ─
-        if page_checkpoints:
-            for page_num in range(start_page, total_pages + 1):
-                try:
-                    page = pdf_document[page_num - 1]
-                    mat = fitz.Matrix(2, 2)
-                    pix = page.get_pixmap(matrix=mat, alpha=False)
-                    img_bytes = pix.tobytes(output="jpeg")
-
-                    # Start Drive upload and AI check in parallel
-                    upload_future = None
-                    if drive_folder_id:
-                        upload_future = loop.run_in_executor(
-                            None, partial(upload_jpeg_to_drive, token, drive_folder_id,
-                                          f"page_{page_num:03d}.jpg", img_bytes)
-                        )
-                    ai_future = loop.run_in_executor(
-                        None, partial(run_vision_check, img_bytes, page_checkpoints, page_num,
-                                      workflow_name, job.get("page_prompt") or None)
-                    )
-
-                    # Await upload first (typically done within the AI call window)
-                    drive_file_id = None
-                    if upload_future:
-                        try:
-                            drive_file_id = await upload_future
-                            page_records.append({"run_id": job_id, "page_num": page_num,
-                                                 "drive_file_id": drive_file_id})
-                        except Exception as e:
-                            print(f"[review] Drive upload failed p{page_num}: {e}")
-
-                    yield f"event: page_ready\ndata: {json.dumps({'page': page_num, 'total_pages': total_pages, 'drive_file_id': drive_file_id})}\n\n"
-
-                    # Await AI result
-                    findings = await ai_future
-
-                    for finding in findings:
-                        finding["id"] = finding_id_counter
-                        finding["page_num"] = page_num
-                        if "location" not in finding or finding["location"] == "":
-                            finding["location"] = f"Page {page_num}"
-                        all_findings.append(finding)
-                        finding_id_counter += 1
-
-                    yield f"event: page_findings\ndata: {json.dumps({'page': page_num, 'findings': findings})}\n\n"
-
-                    if findings:
-                        reviews = await loop.run_in_executor(
-                            None, partial(run_vision_review, img_bytes, findings, page_num)
-                        )
-                        yield f"event: page_review\ndata: {json.dumps({'page': page_num, 'reviews': reviews})}\n\n"
-
-                        review_map = {r["finding_id"]: r for r in reviews}
-                        for f in findings:
-                            rev = review_map.get(f["id"])
-                            if rev:
-                                f["review_status"] = rev["verdict"]
-                                f["review_comment"] = rev["reason"]
-
-                except Exception as e:
-                    job["last_successful_page"] = page_num - 1
-                    save_job(job_id, job)
-                    try:
-                        (job_dir / "findings.json").write_text(
-                            json.dumps(all_findings, ensure_ascii=False), encoding="utf-8"
-                        )
-                    except Exception as save_error:
-                        yield f"event: error\ndata: {json.dumps({'message': f'Could not save findings: {str(save_error)}'})}\n\n"
-
-                    yield f"event: partial_complete\ndata: {json.dumps({'last_successful_page': page_num - 1, 'total_pages': total_pages, 'error_message': str(e)})}\n\n"
-                    return
-
-            try:
-                (job_dir / "findings.json").write_text(
-                    json.dumps(all_findings, ensure_ascii=False), encoding="utf-8"
-                )
-            except Exception as e:
-                yield f"event: error\ndata: {json.dumps({'message': f'Could not save findings: {str(e)}'})}\n\n"
-
-            yield f"event: done\ndata: {json.dumps({'total_findings': len(all_findings)})}\n\n"
-
-        pdf_document.close()
-        del pdf_document
-
-        # ── Document-level check (only if document-scope checkpoints selected) ─
-        if doc_checkpoints or job.get("doc_prompt"):
-            yield f"event: document_start\ndata: {json.dumps({})}\n\n"
-            # Re-fetch PDF bytes — freed early above to save memory during the page loop.
-            try:
-                _pdf_reload = await loop.run_in_executor(
-                    None, partial(get_pdf_bytes_by_id, token, job["file_id"])
-                )
-                pdf_bytes = _pdf_reload.get("pdf_bytes")
-                if not pdf_bytes:
-                    raise ValueError("No PDF bytes retrieved")
-            except Exception as e:
-                yield f"event: error\ndata: {json.dumps({'message': f'Could not reload PDF for document check: {str(e)}'})}\n\n"
+        # status == "processing" — live-follow via the subscribed queue.
+        if q is None:
+            q = state.subscribe(job_id)
+        terminal = {"all_done", "error", "partial_complete"}
+        while True:
+            event, data = await q.get()
+            yield f"event: {event}\ndata: {json.dumps(data)}\n\n"
+            if event in terminal:
                 return
-            try:
-                doc_findings = await loop.run_in_executor(
-                    None, partial(run_document_check, pdf_bytes, doc_checkpoints,
-                                  job.get("doc_prompt") or None)
-                )
-
-                for finding in doc_findings:
-                    finding["id"] = finding_id_counter
-                    finding.setdefault("location", "Document")
-                    all_findings.append(finding)
-                    finding_id_counter += 1
-
-                yield f"event: document_findings\ndata: {json.dumps({'findings': doc_findings})}\n\n"
-
-                if doc_findings:
-                    doc_reviews = await loop.run_in_executor(
-                        None, partial(run_document_review, pdf_bytes, doc_findings)
-                    )
-                    yield f"event: document_review\ndata: {json.dumps({'reviews': doc_reviews})}\n\n"
-
-                    doc_review_map = {r["finding_id"]: r for r in doc_reviews}
-                    for f in doc_findings:
-                        rev = doc_review_map.get(f["id"])
-                        if rev:
-                            f["review_status"] = rev["verdict"]
-                            f["review_comment"] = rev["reason"]
-
-                (job_dir / "findings.json").write_text(
-                    json.dumps(all_findings, ensure_ascii=False), encoding="utf-8"
-                )
-
-            except Exception as e:
-                yield f"event: error\ndata: {json.dumps({'message': f'Document-level check failed: {str(e)}'})}\n\n"
-
-            del pdf_bytes  # free immediately after use
-
-        asyncio.create_task(save_run_to_history(
-            job_id=job_id,
-            job=dict(job),
-            all_findings=list(all_findings),
-            total_pages=total_pages,
-            page_records=list(page_records),
-            drive_folder_id=drive_folder_id,
-        ))
-
-        yield f"event: all_done\ndata: {json.dumps({'total_findings': len(all_findings)})}\n\n"
-
-        job["status"] = "completed"
-        job.pop("last_successful_page", None)
-        save_job(job_id, job)
-
     finally:
-        state._ACTIVE_JOBS.discard(job_id)
+        if q is not None:
+            state.unsubscribe(job_id, q)
 
 
 # ── Routes ─────────────────────────────────────────────────────────────────────
@@ -289,7 +106,7 @@ async def run_check(
     workflow_id: Annotated[str, Form()],
     checkpoint_ids: Annotated[list[str], Form()] = [],
 ):
-    """Validate input and create a job, then redirect to the processing page."""
+    """Validate input, create+start a run, then redirect to the processing page."""
     user = auth.get_current_user(request)
     token = auth.get_token(request)
 
@@ -332,11 +149,15 @@ async def run_check(
     selected_checkpoints = [
         state.CHECKPOINT_MAP[cid] for cid in checkpoint_ids if cid in state.CHECKPOINT_MAP
     ]
+    workflow = next((w for w in state.WORKFLOWS if w["id"] == workflow_id), None)
 
-    loop = asyncio.get_running_loop()
     try:
-        file_data = await loop.run_in_executor(
-            None, partial(get_file_as_pdf, token, drive_url.strip())
+        result = await create_run(
+            token=token,
+            checked_by=user["email"],
+            drive_url=drive_url.strip(),
+            workflow=workflow,
+            selected_checkpoints=selected_checkpoints,
         )
     except ValueError as exc:
         filtered_checkpoints = filter_by_workflow(state.CHECKPOINTS, workflow_id)
@@ -365,29 +186,17 @@ async def run_check(
             error=f"Could not read the file: {error_msg}",
         ))
 
-    job_id = uuid.uuid4().hex
-    save_job(job_id, {
-        "drive_url": drive_url.strip(),
-        "checked_by": user["email"],
-        "file_id": file_data["file_id"],
-        "file_type": file_data["file_type"],
-        "title": file_data["title"],
-        "workflow_id": workflow_id,
-        "checkpoint_ids": [cp["id"] for cp in selected_checkpoints],
-        "status": "processing",
-    })
-
-    return RedirectResponse(url=f"/process/{job_id}", status_code=303)
+    return RedirectResponse(url=f"/process/{result['job_id']}", status_code=303)
 
 
 @router.get("/process/{job_id}", response_class=HTMLResponse)
-async def show_process(request: Request, job_id: str, retry_from: int = None):
+async def show_process(request: Request, job_id: str):
     user = auth.get_current_user(request)
     if not user:
         return RedirectResponse(url="/login")
 
-    job = load_job(job_id)
-    if not job:
+    run = db.fetch_run(job_id)
+    if not run:
         return RedirectResponse(url="/?error=Job+not+found.+Please+run+a+new+check.")
 
     checkpoint_names = {cp["id"]: cp["category"] for cp in state.CHECKPOINTS}
@@ -395,35 +204,20 @@ async def show_process(request: Request, job_id: str, retry_from: int = None):
     return templates.TemplateResponse("process.html", ctx(
         request, user,
         job_id=job_id,
-        title=job["title"],
-        retry_from=retry_from,
+        title=run.get("document_name", ""),
         checkpoint_names=checkpoint_names,
     ))
 
 
 @router.get("/stream/{job_id}")
-async def stream_processing(request: Request, job_id: str, retry_from: int = None):
-    """SSE endpoint for streaming page processing."""
+async def stream_processing(request: Request, job_id: str):
+    """SSE endpoint: replays saved progress, then live-tails if still processing."""
     user = auth.get_current_user(request)
-    token = auth.get_token(request)
-
-    if not user or not token:
+    if not user:
         return RedirectResponse(url="/login")
 
-    if job_id in state._ACTIVE_JOBS:
-        async def _already_processing():
-            yield (
-                f"event: error\ndata: {json.dumps({'message': 'This job is already being processed. '
-                'Please wait for the current run to complete.'})}\n\n"
-            )
-        return StreamingResponse(
-            _already_processing(),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-        )
-
     return StreamingResponse(
-        _stream_processing(job_id, token, retry_from),
+        _stream_view(job_id),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
@@ -447,12 +241,14 @@ async def retry_check(request: Request, job_id: str):
     if not user or not token:
         return RedirectResponse(url="/login", status_code=303)
 
-    job = load_job(job_id)
-    if not job:
+    try:
+        await resume_run(job_id, token)
+    except LookupError:
         return RedirectResponse(url="/?error=Job+not+found.", status_code=303)
+    except ValueError:
+        pass  # already completed — nothing to resume, just show it
 
-    from_page = job.get("last_successful_page", 0) + 1
-    return RedirectResponse(url=f"/process/{job_id}?retry_from={from_page}", status_code=303)
+    return RedirectResponse(url=f"/process/{job_id}", status_code=303)
 
 
 @router.post("/insert-comments/{job_id}")
@@ -468,29 +264,24 @@ async def insert_comments(
     if not user or not token:
         return RedirectResponse(url="/login", status_code=303)
 
-    job = load_job(job_id)
-    if not job:
+    run = db.fetch_run(job_id)
+    if not run:
         return {"error": "Job not found"}
 
-    job_dir = state._JOBS_DIR / job_id
-    findings_file = job_dir / "findings.json"
-    if not findings_file.exists():
-        return {"error": "Findings not found"}
-
-    all_findings = json.loads(findings_file.read_text(encoding="utf-8"))
+    all_findings = db.fetch_run_findings(job_id)
     selected_finding_ids = [int(fid) for fid in finding_ids if fid.isdigit()]
     selected_findings = [f for f in all_findings if f.get("id") in selected_finding_ids]
 
     file_data = {
-        "file_id": job["file_id"],
-        "file_type": job["file_type"],
-        "title": job["title"],
+        "file_id": extract_file_id(run["drive_url"]),
+        "file_type": run["file_type"],
+        "title": run["document_name"],
     }
 
     loop = asyncio.get_running_loop()
     try:
         posted = await loop.run_in_executor(
-            None, partial(post_selected_comments, token, file_data, selected_findings, state.CHECKPOINT_MAP)
+            None, lambda: post_selected_comments(token, file_data, selected_findings, state.CHECKPOINT_MAP)
         )
         return {"posted": posted, "total_selected": len(selected_findings)}
     except Exception as exc:

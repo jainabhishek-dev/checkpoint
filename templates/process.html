@@ -146,9 +146,10 @@ function createPageCard(page, totalPages) {
   return card;
 }
 
-// Open EventSource to stream processing
-const retryFrom = {{ retry_from|tojson }};
-const streamUrl = retryFrom ? `/stream/${jobId}?retry_from=${retryFrom}` : `/stream/${jobId}`;
+// Open EventSource to stream processing. The backend replays whatever's already
+// saved (including a prior partial run) before live-tailing, so no query param
+// is needed to indicate a resume.
+const streamUrl = `/stream/${jobId}`;
 const eventSource = new EventSource(streamUrl);
 
 eventSource.addEventListener('start', (event) => {

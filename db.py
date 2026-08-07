@@ -180,6 +180,18 @@ def insert_run(row: dict) -> None:
     resp.raise_for_status()
 
 
+def update_run(run_id: str, fields: dict) -> None:
+    """PATCH arbitrary fields on a run row (status, progress, totals, etc.)."""
+    resp = httpx.patch(
+        f"{_base_url()}/runs",
+        headers=_headers(),
+        params={"id": f"eq.{run_id}"},
+        json=fields,
+        timeout=15,
+    )
+    resp.raise_for_status()
+
+
 def insert_run_pages(rows: list[dict]) -> None:
     """Batch-insert all page image records for a run in one call."""
     resp = httpx.post(
@@ -191,8 +203,42 @@ def insert_run_pages(rows: list[dict]) -> None:
     resp.raise_for_status()
 
 
-def insert_run_findings(rows: list[dict]) -> None:
-    """Batch-insert all findings for a run in one call."""
+def delete_run_page(run_id: str, page_num: int) -> None:
+    """Delete any existing page-image record for this page. Called before
+    reprocessing a page on resume so a retry can't leave two Drive image
+    records (one orphaned) for the same page_num."""
+    resp = httpx.delete(
+        f"{_base_url()}/run_pages",
+        headers=_headers(),
+        params={"run_id": f"eq.{run_id}", "page_num": f"eq.{page_num}"},
+        timeout=10,
+    )
+    resp.raise_for_status()
+
+
+def delete_run_findings_for_slot(run_id: str, page_num: int | None) -> None:
+    """Delete any existing findings for a specific page (or the document-level
+    slot when page_num is None). Called before reprocessing that page/step on
+    resume — makes it idempotent instead of appending duplicate finding rows
+    if a previous attempt inserted findings but failed before finishing review."""
+    params = {"run_id": f"eq.{run_id}"}
+    if page_num is None:
+        params["page_num"] = "is.null"
+    else:
+        params["page_num"] = f"eq.{page_num}"
+    resp = httpx.delete(
+        f"{_base_url()}/run_findings",
+        headers=_headers(),
+        params=params,
+        timeout=10,
+    )
+    resp.raise_for_status()
+
+
+def insert_run_findings(rows: list[dict]) -> list[dict]:
+    """Insert findings and return the inserted rows (including their generated ids),
+    in the same order as `rows` — callers rely on this to correlate findings with
+    their real Supabase id for the AI review pass and for later /findings/{id}/review calls."""
     resp = httpx.post(
         f"{_base_url()}/run_findings",
         headers=_headers(),
@@ -200,6 +246,7 @@ def insert_run_findings(rows: list[dict]) -> None:
         timeout=15,
     )
     resp.raise_for_status()
+    return resp.json()
 
 
 def fetch_runs(workflow_id: str | None = None) -> list[dict]:

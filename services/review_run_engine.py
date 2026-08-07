@@ -117,7 +117,8 @@ def start_run_task(job_id: str, token: dict) -> None:
     if job_id in state._ACTIVE_JOBS:
         return
     state._ACTIVE_JOBS.add(job_id)
-    asyncio.create_task(process_run(job_id, token))
+    task = asyncio.create_task(process_run(job_id, token))
+    state._RUN_TASKS[job_id] = task
 
 
 # ── Findings persistence ─────────────────────────────────────────────────────
@@ -362,6 +363,26 @@ async def process_run(job_id: str, token: dict) -> None:
         }))
         state.publish(job_id, "all_done", {"total_findings": total_findings})
 
+    except asyncio.CancelledError:
+        # Raised by task.cancel() (the "Ongoing tasks" admin page's Cancel button).
+        # Whatever AI call was already in flight for the current page keeps running
+        # to completion in its background thread — asyncio can't interrupt that —
+        # but this stops anything further from being scheduled after it.
+        try:
+            fresh = await loop.run_in_executor(None, partial(db.fetch_run, job_id))
+            last_page = (fresh or {}).get("last_successful_page") or 0
+            total = (fresh or {}).get("total_pages") or 0
+            await loop.run_in_executor(None, partial(db.update_run, job_id, {
+                "status": "cancelled", "error_message": "Cancelled by admin", "updated_at": _now_iso(),
+            }))
+            state.publish(job_id, "partial_complete", {
+                "last_successful_page": last_page,
+                "total_pages": total,
+                "error_message": "Cancelled by admin",
+            })
+        except Exception:
+            pass
+        raise
     except Exception as e:
         try:
             await loop.run_in_executor(None, partial(db.update_run, job_id, {
@@ -372,3 +393,4 @@ async def process_run(job_id: str, token: dict) -> None:
         state.publish(job_id, "error", {"message": str(e)})
     finally:
         state._ACTIVE_JOBS.discard(job_id)
+        state._RUN_TASKS.pop(job_id, None)

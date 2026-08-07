@@ -28,6 +28,14 @@ _ACTIVE_JOBS: set[str] = set()
 # browser tab watching a run does not stop it; queues are purely for live viewers.
 _JOB_SUBSCRIBERS: dict[str, list["asyncio.Queue"]] = {}
 
+# Task handles for currently-running review runs, keyed by job_id — this is what
+# lets the "Ongoing tasks" admin page actually cancel one (task.cancel()).
+# Deliberately separate from _ACTIVE_JOBS: only the review-run engine populates
+# this, so CIC/AK runs (which still process inline within their SSE request,
+# with no detached task to hold onto) are simply absent from it rather than
+# needing a fake entry.
+_RUN_TASKS: dict[str, "asyncio.Task"] = {}
+
 
 def subscribe(job_id: str) -> "asyncio.Queue":
     q: asyncio.Queue = asyncio.Queue()

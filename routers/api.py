@@ -720,6 +720,44 @@ async def stream_ak_processing(request: Request, job_id: str):
     )
 
 
+# ── Admin — ongoing tasks ────────────────────────────────────────────────────
+
+@router.get("/admin/ongoing-tasks")
+async def api_admin_ongoing_tasks(request: Request):
+    """List review runs currently being processed by this backend process
+    (i.e. with a live background task, not just a "processing" row in
+    Supabase — a run stuck from a dead process won't show up here; it shows
+    as stale/resumable in History instead)."""
+    _require_admin(request)
+    job_ids = list(state._RUN_TASKS.keys())
+    tasks = []
+    for job_id in job_ids:
+        run = db.fetch_run(job_id)
+        if not run:
+            continue
+        tasks.append({
+            "job_id": job_id,
+            "document_name": run.get("document_name"),
+            "workflow_name": run.get("workflow_name"),
+            "checked_by": run.get("checked_by"),
+            "total_pages": run.get("total_pages"),
+            "last_successful_page": run.get("last_successful_page"),
+            "started_at": to_ist(run.get("created_at")),
+            "updated_at": run.get("updated_at"),
+        })
+    return {"tasks": tasks}
+
+
+@router.post("/admin/ongoing-tasks/{job_id}/cancel")
+async def api_admin_cancel_task(request: Request, job_id: str):
+    _require_admin(request)
+    task = state._RUN_TASKS.get(job_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="No running task with this id")
+    task.cancel()
+    return {"cancelling": True}
+
+
 # ── Admin — workflows ──────────────────────────────────────────────────────────
 
 @router.get("/admin/workflows")
